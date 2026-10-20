@@ -1,5 +1,5 @@
 use crate::capture::{
-    CameraFov, CaptureBundle, CaptureSource, ImageHandle, compute_camera_intrinsics,
+    CameraFov, CaptureBundle, CaptureCamera, ImageHandle, compute_camera_intrinsics,
     driver::{
         CaptureConfig, CaptureFrameId, CapturedFrame, CapturedFrameKind, GpuCaptureHandler,
         SnapshotAsync, SnapshotSync,
@@ -7,6 +7,7 @@ use crate::capture::{
     setup_capture_camera, setup_preview_window, sync_capture_camera,
 };
 use crate::components::{Controlled, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim};
+use crate::statistic::ProjectileStatistics;
 use crate::systems::{ChassisObservationFrame, GameplaySystems};
 use crate::talos::plugin::{to_ros_quat, to_ros_translation};
 use bevy::ecs::world::DeferredWorld;
@@ -47,6 +48,8 @@ struct CapturedPoseData {
     gimbal_quat: [f32; 4],
     muzzle_rel: [f32; 3],
     camera_rel: [f32; 3],
+    camera_quat: [f32; 4],
+    muzzle_quat: [f32; 4],
     chassis_observation: ChassisObservation,
 }
 
@@ -166,16 +169,21 @@ pub fn publish_talos_runtime_state_system(
     context: Option<Res<TalosCaptureContext>>,
     frame_stamp: Res<TalosFrameStamp>,
     following: Res<SubscribeAutoAim>,
+    statistics: Res<ProjectileStatistics>,
 ) {
     let Some(ctx) = context else {
         return;
     };
 
     if let Ok(mut publisher) = ctx.publisher.lock() {
+        // Talos v2 extension: naturally aligned little-endian diagnostic counters.
+        let mut diagnostic = [0; 55];
+        diagnostic[3..7].copy_from_slice(&statistics.launch_count.to_le_bytes());
+        diagnostic[7..11].copy_from_slice(&statistics.accurate_count.to_le_bytes());
         publisher.publish_runtime_state(RuntimeState {
             timestamp_ns: frame_stamp.timestamp_ns,
             following: u8::from(following.load(Ordering::Acquire)),
-            _pad: [0; 55],
+            _pad: diagnostic,
         });
     }
 }
@@ -235,11 +243,9 @@ impl Plugin for TalosCapturePlugin {
 fn extract_pose_data(
     mut pose_data: ResMut<ExtractedPoseData>,
     frame_stamp: Extract<Res<TalosFrameStamp>>,
-    camera: Extract<Query<&GlobalTransform, With<CaptureSource>>>,
+    camera: Extract<Query<&GlobalTransform, With<CaptureCamera>>>,
     gimbal: Extract<Query<&GlobalTransform, (With<Controlled>, With<InfantryGimbal>)>>,
-    muzzle_offset: Extract<
-        Query<(&GlobalTransform, &Transform), (With<InfantryLaunchOffset>, With<Controlled>)>,
-    >,
+    muzzle_offset: Extract<Query<&GlobalTransform, (With<InfantryLaunchOffset>, With<Controlled>)>>,
     chassis_obs: Extract<Res<ChassisObservationFrame>>,
 ) {
     pose_data.frame_seq = frame_stamp.frame_seq;
@@ -255,7 +261,7 @@ fn extract_pose_data(
         pose_data.valid = false;
         return;
     };
-    let Ok((muzzle_global, muzzle_local)) = muzzle_offset.single() else {
+    let Ok(muzzle_global) = muzzle_offset.single() else {
         pose_data.pose = None;
         pose_data.valid = false;
         return;
@@ -265,7 +271,6 @@ fn extract_pose_data(
         cam_transform,
         gimbal_transform,
         muzzle_global,
-        muzzle_local,
         &chassis_obs,
         pose_data.frame_seq,
         pose_data.timestamp_ns,
@@ -277,17 +282,21 @@ fn captured_pose_data(
     cam_transform: &GlobalTransform,
     gimbal_transform: &GlobalTransform,
     muzzle_global: &GlobalTransform,
-    muzzle_local: &Transform,
     chassis_obs: &ChassisObservationFrame,
     frame_seq: u64,
     timestamp_ns: u64,
 ) -> CapturedPoseData {
-    let cam_rel = cam_transform.reparented_to(gimbal_transform);
-    let muzzle_rel = muzzle_global.reparented_to(gimbal_transform);
-
-    let gimbal_rot = gimbal_transform.rotation()
-        * muzzle_local.rotation
-        * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
+    // The gun model launches along local +Y. This aiming basis points -Z along
+    // that direction, which becomes +X after the Bevy-to-ROS basis conversion.
+    // Use the actual world muzzle rotation so intervening scene parents are included.
+    let gimbal_rot = muzzle_global.rotation() * Quat::from_rotation_x(PI / 2.0);
+    let reference = GlobalTransform::from(
+        Transform::from_translation(gimbal_transform.translation()).with_rotation(gimbal_rot),
+    );
+    let cam_rel = cam_transform.reparented_to(&reference);
+    let muzzle_rel = muzzle_global.reparented_to(&reference);
+    let camera_quat = to_ros_quat(cam_rel.rotation);
+    let muzzle_quat = to_ros_quat(muzzle_rel.rotation);
 
     let gimbal_ros = to_ros_translation(gimbal_transform.translation());
     let gimbal_rot = to_ros_quat(gimbal_rot);
@@ -299,6 +308,8 @@ fn captured_pose_data(
         gimbal_quat: [gimbal_rot.w, gimbal_rot.x, gimbal_rot.y, gimbal_rot.z],
         muzzle_rel: [muzzle.x, muzzle.y, muzzle.z],
         camera_rel: [camera.x, camera.y, camera.z],
+        camera_quat: [camera_quat.w, camera_quat.x, camera_quat.y, camera_quat.z],
+        muzzle_quat: [muzzle_quat.w, muzzle_quat.x, muzzle_quat.y, muzzle_quat.z],
         chassis_observation: ChassisObservation {
             frame_seq,
             timestamp_ns,
@@ -354,7 +365,7 @@ fn publish_pose_data(
     publisher.publish_pose(
         PoseIndex::Muzzle,
         pose.muzzle_rel,
-        [1.0, 0.0, 0.0, 0.0],
+        pose.muzzle_quat,
         frame_seq,
         timestamp_ns,
     );
@@ -362,7 +373,7 @@ fn publish_pose_data(
     publisher.publish_pose(
         PoseIndex::Camera,
         pose.camera_rel,
-        [1.0, 0.0, 0.0, 0.0],
+        pose.camera_quat,
         frame_seq,
         timestamp_ns,
     );
@@ -390,4 +401,108 @@ fn publish_pose_data(
         frame_seq,
         timestamp_ns,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quaternion(wxyz: [f32; 4]) -> Quat {
+        Quat::from_xyzw(wxyz[1], wxyz[2], wxyz[3], wxyz[0])
+    }
+
+    fn assert_vec_close(actual: Vec3, expected: Vec3) {
+        assert!(
+            (actual - expected).length() < 2e-5,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn assert_quat_close(actual: Quat, expected: Quat) {
+        assert!(
+            actual.dot(expected).abs() > 1.0 - 2e-6,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn pose_chain_reconstructs_actual_camera_and_muzzle_world_poses() {
+        let gimbal =
+            GlobalTransform::from(
+                Transform::from_translation(Vec3::new(3.2, 0.8, -6.7))
+                    .with_rotation(Quat::from_euler(EulerRot::YXZ, 0.8, -0.3, 0.1)),
+            );
+        // Include an intermediate scene parent: local muzzle rotation alone is
+        // insufficient to reconstruct the true world gun axis.
+        let muzzle = gimbal
+            .mul_transform(Transform::from_rotation(Quat::from_rotation_z(0.12)))
+            .mul_transform(
+                Transform::from_translation(Vec3::new(0.04, 0.2, -0.15))
+                    .with_rotation(Quat::from_euler(EulerRot::XYZ, -1.3, 0.07, -0.05)),
+            );
+        let aiming_rotation = muzzle.rotation() * Quat::from_rotation_x(PI / 2.0);
+        let camera = GlobalTransform::from(
+            Transform::from_translation(
+                gimbal.translation() + aiming_rotation * Vec3::new(0.08, 0.11, -0.03),
+            )
+            .with_rotation(aiming_rotation * Quat::from_euler(EulerRot::XYZ, 0.02, -0.04, 0.01)),
+        );
+        let pose = captured_pose_data(
+            &camera,
+            &gimbal,
+            &muzzle,
+            &ChassisObservationFrame::default(),
+            1234,
+            987654321,
+        );
+        let q_world_gimbal = quaternion(pose.gimbal_quat);
+        let p_world_gimbal = Vec3::from_array(pose.gimbal_ros);
+        assert_quat_close(q_world_gimbal, to_ros_quat(aiming_rotation));
+        assert_quat_close(
+            q_world_gimbal * quaternion(pose.camera_quat),
+            to_ros_quat(camera.rotation()),
+        );
+        assert_quat_close(
+            q_world_gimbal * quaternion(pose.muzzle_quat),
+            to_ros_quat(muzzle.rotation()),
+        );
+        assert_vec_close(
+            p_world_gimbal + q_world_gimbal * Vec3::from_array(pose.camera_rel),
+            to_ros_translation(camera.translation()),
+        );
+        assert_vec_close(
+            p_world_gimbal + q_world_gimbal * Vec3::from_array(pose.muzzle_rel),
+            to_ros_translation(muzzle.translation()),
+        );
+        assert_vec_close(
+            q_world_gimbal * Vec3::X,
+            to_ros_translation(muzzle.rotation() * Vec3::Y),
+        );
+        assert_vec_close(
+            q_world_gimbal * quaternion(pose.camera_quat) * Vec3::X,
+            to_ros_translation(camera.rotation() * Vec3::NEG_Z),
+        );
+        assert_eq!(pose.chassis_observation.frame_seq, 1234);
+        assert_eq!(pose.chassis_observation.timestamp_ns, 987654321);
+    }
+
+    #[test]
+    fn aligned_camera_has_identity_relative_orientation() {
+        let gimbal = GlobalTransform::from(
+            Transform::from_translation(Vec3::new(-2.0, 1.5, 4.0))
+                .with_rotation(Quat::from_rotation_y(-0.6)),
+        );
+        let muzzle =
+            gimbal.mul_transform(Transform::from_rotation(Quat::from_rotation_x(-PI / 2.0)));
+        let pose = captured_pose_data(
+            &gimbal,
+            &gimbal,
+            &muzzle,
+            &ChassisObservationFrame::default(),
+            0,
+            0,
+        );
+        assert_quat_close(quaternion(pose.camera_quat), Quat::IDENTITY);
+        assert_quat_close(quaternion(pose.gimbal_quat), to_ros_quat(gimbal.rotation()));
+    }
 }

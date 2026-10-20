@@ -18,6 +18,7 @@ use bevy::{
     },
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -355,14 +356,51 @@ struct ImageCopiers(Vec<ImageCopier>);
 #[derive(Resource, Default)]
 struct ImageCopyDriverInstalled(bool);
 
+// Realtime consumers prefer a recent frame over a growing queue of stale work.
+// Explicit dataset submissions must still deliver every requested channel.
+const MAX_REALTIME_READBACKS: usize = 3;
+
+struct ReadbackPermit(Arc<AtomicUsize>);
+
+impl ReadbackPermit {
+    fn acquire(count: &Arc<AtomicUsize>, realtime: bool) -> Option<Self> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if realtime && count >= MAX_REALTIME_READBACKS {
+                    None
+                } else {
+                    Some(count + 1)
+                }
+            })
+            .ok()?;
+        Some(Self(count.clone()))
+    }
+}
+
+impl Drop for ReadbackPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ImageCopier {
     config: CaptureConfig,
     src_image: Handle<Image>,
-    queue: Mutex<VecDeque<(Buffer, Vec<DynSnapshotSync>, u32, u32, TextureFormat)>>,
+    queue: Mutex<
+        VecDeque<(
+            Buffer,
+            Vec<DynSnapshotSync>,
+            u32,
+            u32,
+            TextureFormat,
+            ReadbackPermit,
+        )>,
+    >,
     free_buffers: Arc<Mutex<Vec<Buffer>>>,
     /// Pool of frame-sized output buffers, so the per-frame conversion allocates nothing.
     free_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     snapshots: Arc<Vec<ToSyncSnapshot>>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl ImageCopier {
@@ -378,6 +416,7 @@ impl ImageCopier {
             free_buffers: Arc::new(Mutex::new(Vec::new())),
             free_frames: Arc::new(Mutex::new(Vec::new())),
             snapshots,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -597,6 +636,10 @@ fn image_copy_driver(world: &World, mut render_context: RenderContext) {
             (size.width as usize / block_dimensions.0 as usize) * block_size as usize,
         );
         let buffer_size = padded_bytes_per_row as u64 * size.height as u64;
+        let Some(permit) = ReadbackPermit::acquire(&copier.in_flight, active_frame_id.is_none())
+        else {
+            continue;
+        };
         let buffer = copier.acquire_buffer(render_context.render_device(), buffer_size);
 
         render_context.command_encoder().copy_texture_to_buffer(
@@ -622,7 +665,7 @@ fn image_copy_driver(world: &World, mut render_context: RenderContext) {
         );
 
         let mut queue = copier.queue.lock().unwrap();
-        queue.push_back((buffer, snapshots, size.width, size.height, format));
+        queue.push_back((buffer, snapshots, size.width, size.height, format, permit));
     }
 
     if let Some(id) = active_frame_id {
@@ -646,9 +689,8 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
                 continue;
             };
             let mut guard = copier.queue.lock().unwrap();
-            guard
-                .pop_front()
-                .map(|(buffer, snapshots, width, height, texture_format)| {
+            guard.pop_front().map(
+                |(buffer, snapshots, width, height, texture_format, permit)| {
                     (
                         buffer,
                         snapshots,
@@ -658,8 +700,10 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
                         copier.free_buffers.clone(),
                         copier.free_frames.clone(),
                         copier.config.clone(),
+                        permit,
                     )
-                })
+                },
+            )
         };
 
         let Some((
@@ -671,6 +715,7 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
             free_buffers,
             free_frames,
             config,
+            permit,
         )) = next
         else {
             continue;
@@ -695,6 +740,8 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
 
         AsyncComputeTaskPool::get()
             .spawn(async move {
+                // Keep the budget until conversion and every publisher finish.
+                let _permit = permit;
                 r.await
                     .expect("capture buffer map channel dropped")
                     .expect("Failed to map buffer");
@@ -842,6 +889,24 @@ impl Plugin for CameraCapturePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_readback_budget_covers_async_work_and_releases_on_drop() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut permits: Vec<_> = (0..MAX_REALTIME_READBACKS)
+            .map(|_| ReadbackPermit::acquire(&count, true).unwrap())
+            .collect();
+        assert!(ReadbackPermit::acquire(&count, true).is_none());
+        drop(permits.pop());
+        let replacement = ReadbackPermit::acquire(&count, true).unwrap();
+        assert!(ReadbackPermit::acquire(&count, true).is_none());
+        // Dataset capture may exceed the realtime limit instead of dropping a channel.
+        let dataset = ReadbackPermit::acquire(&count, false).unwrap();
+        assert_eq!(count.load(Ordering::Acquire), MAX_REALTIME_READBACKS + 1);
+        drop((permits, replacement, dataset));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert!(ReadbackPermit::acquire(&count, true).is_some());
+    }
 
     #[test]
     fn rgb8_layout_drops_row_padding_and_alpha() {

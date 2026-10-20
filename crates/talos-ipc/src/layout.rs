@@ -375,3 +375,61 @@ impl Default for ShmMetaRegion {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn talos_v2_layout_matches_the_cpp_simulator_mirror() {
+        // Keep in step with SPR_Vision_Tutorial_27/sim_bridge/talos_layout.hpp.
+        // These offsets include repr(C)'s implicit alignment padding.
+        assert_eq!((SHM_MAGIC, SHM_VERSION), (0x5441_4C05, 2));
+        assert_eq!((IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_CHANNELS), (1440, 1080, 3));
+        assert_eq!(IMAGE_SIZE, 4_665_600);
+        assert_eq!(IMAGE_POOL_SIZE, 13_996_800);
+
+        assert_eq!(size_of::<ImageMeta>(), 32);
+        assert_eq!(offset_of!(ImageMeta, timestamp_ns), 8);
+        assert_eq!(offset_of!(ImageMeta, width), 16);
+        assert_eq!(offset_of!(ImageMeta, height), 20);
+        assert_eq!(offset_of!(ImageMeta, buffer_id), 24);
+        assert_eq!(offset_of!(ImageMeta, format), 25);
+        assert_eq!((size_of::<PoseMeta>(), align_of::<PoseMeta>()), (64, 64));
+        assert_eq!(offset_of!(PoseMeta, position), 8);
+        assert_eq!(offset_of!(PoseMeta, quaternion), 20);
+        assert_eq!(offset_of!(PoseMeta, timestamp_ns), 40);
+        assert_eq!(offset_of!(PoseMeta, _pad), 48);
+        assert_eq!((size_of::<GimbalCmd>(), align_of::<GimbalCmd>()), (32, 32));
+        assert_eq!(offset_of!(GimbalCmd, timestamp_ns), 0);
+        assert_eq!(offset_of!(GimbalCmd, yaw_deg), 8);
+        assert_eq!(offset_of!(GimbalCmd, pitch_deg), 12);
+        assert_eq!(offset_of!(GimbalCmd, distance_m), 16);
+        assert_eq!(offset_of!(GimbalCmd, fire_advice), 20);
+        assert_eq!(offset_of!(GimbalCmd, _pad), 21);
+
+        assert_eq!(size_of::<ImageTripleBuffer>(), 192);
+        assert_eq!(size_of::<PoseTripleBuffer>(), 256);
+        assert_eq!(size_of::<GimbalTripleBuffer>(), 192);
+        assert_eq!(offset_of!(ImageTripleBuffer, slots), 64);
+        assert_eq!(offset_of!(PoseTripleBuffer, slots), 64);
+        assert_eq!(offset_of!(GimbalTripleBuffer, slots), 64);
+        assert_eq!(
+            (size_of::<RuntimeState>(), align_of::<RuntimeState>()),
+            (64, 64)
+        );
+        assert_eq!(offset_of!(RuntimeState, following), 8);
+        assert_eq!(offset_of!(RuntimeState, _pad), 9);
+
+        assert_eq!(size_of::<ShmMetaRegion>(), 3712);
+        assert_eq!(offset_of!(ShmMetaRegion, header), 0);
+        assert_eq!(offset_of!(ShmMetaRegion, image), 64);
+        assert_eq!(offset_of!(ShmMetaRegion, poses), 256);
+        assert_eq!(offset_of!(ShmMetaRegion, gimbal_cmd), 1536);
+        assert_eq!(offset_of!(ShmMetaRegion, camera_info), 1728);
+        assert_eq!(offset_of!(ShmMetaRegion, chassis_observation), 1856);
+        assert_eq!(offset_of!(ShmMetaRegion, ground_truth), 1984);
+        assert_eq!(offset_of!(ShmMetaRegion, runtime_state), 3648);
+    }
+}

@@ -4,14 +4,31 @@ use bevy::prelude::*;
 use core::{f32::consts::PI, time::Duration};
 
 use crate::components::{
-    Controlled, DartLaunch, DartProjectile, DartSetting, GameLayer, Infantry, InfantryChassis,
-    InfantryGimbal, InfantryLaunchOffset, ProjectileCooldown, ProjectileLifetime,
-    ProjectileSetting,
+    Controlled, DartLaunch, DartProjectile, DartSetting, GameLayer, Infantry, InfantryLaunchOffset,
+    ProjectileCooldown, ProjectileLifetime, ProjectileSetting,
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::Projectile;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{ControllerState, request_controller_rumble};
+
+// All launch sources share one clock, including frames with no fire request.
+#[derive(Resource, Default)]
+pub(crate) struct ProjectileCooldownClock(Duration);
+
+fn try_consume_cooldown(
+    timer: &mut Timer,
+    clock: &mut ProjectileCooldownClock,
+    now: Duration,
+) -> bool {
+    timer.tick(now.saturating_sub(clock.0));
+    clock.0 = now;
+    if !timer.is_finished() {
+        return false;
+    }
+    timer.reset();
+    true
+}
 
 pub fn setup_projectile(
     mut commands: Commands,
@@ -20,6 +37,7 @@ pub fn setup_projectile(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    commands.insert_resource(ProjectileCooldownClock::default());
     commands.insert_resource(ProjectileSetting(
         meshes.add(Sphere::new(config.projectile.diameter / 2.0)),
         materials.add(StandardMaterial {
@@ -38,6 +56,7 @@ pub fn setup_projectile(
 pub fn projectile_launch(
     time: Res<Time>,
     mut cooldown: ResMut<ProjectileCooldown>,
+    mut cooldown_clock: ResMut<ProjectileCooldownClock>,
     mut stats: ResMut<ProjectileStatistics>,
     config: Res<SimulationConfig>,
     _asset_server: Res<AssetServer>,
@@ -45,30 +64,22 @@ pub fn projectile_launch(
     controller: Option<Res<ControllerState>>,
     mut rumble_requests: MessageWriter<GamepadRumbleRequest>,
     setting: Res<ProjectileSetting>,
-    infantry: Single<
-        (&Transform, &LinearVelocity, &AngularVelocity),
-        (With<Infantry>, With<Controlled>),
-    >,
-    gimbal: Single<
-        (&GlobalTransform, &InfantryGimbal),
-        (With<Controlled>, Without<InfantryChassis>),
-    >,
-    launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
+    infantry: Single<(&LinearVelocity, &AngularVelocity), (With<Infantry>, With<Controlled>)>,
+    launch_offset: Single<&GlobalTransform, (With<Controlled>, With<InfantryLaunchOffset>)>,
 ) {
-    cooldown.tick(time.delta());
-    if !cooldown.is_finished() {
+    if !try_consume_cooldown(&mut cooldown, &mut cooldown_clock, time.elapsed()) {
         return;
     }
-    cooldown.reset();
 
-    stats.increase_launch();
-    let direction = (gimbal.0.rotation() * launch_offset.rotation)
+    let direction = launch_offset
+        .rotation()
         .mul_vec3(Vec3::Y)
         .normalize_or_zero();
     if direction == Vec3::ZERO {
         return;
     }
-    let vel = infantry.1.0 + direction * config.projectile.speed;
+    stats.increase_launch();
+    let vel = infantry.0.0 + direction * config.projectile.speed;
     commands.spawn((
         RigidBody::Dynamic,
         Collider::sphere(config.projectile.diameter / 2.0),
@@ -80,10 +91,8 @@ pub fn projectile_launch(
         Mesh3d(setting.0.clone()),
         MeshMaterial3d(setting.1.clone()),
         LinearVelocity(vel),
-        AngularVelocity(infantry.2.0),
-        Transform::IDENTITY.with_translation(
-            infantry.0.translation + (gimbal.0.rotation() * launch_offset.translation),
-        ),
+        AngularVelocity(infantry.1.0),
+        Transform::from_translation(launch_offset.translation()),
         ProjectileLifetime(Timer::from_seconds(
             config.projectile.lifetime,
             TimerMode::Once,
@@ -218,5 +227,135 @@ pub fn cleanup_projectiles(
         if lifetime.is_finished() {
             commands.entity(entity).despawn();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::InfantryGimbal;
+    use crate::robomaster::prelude::{INFANTRY_THREE_CONFIG, Team};
+    use bevy::transform::TransformSystems;
+
+    #[test]
+    fn launch_uses_current_propagated_muzzle_position_and_direction() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin, AssetPlugin::default()))
+            .add_message::<GamepadRumbleRequest>()
+            .insert_resource(SimulationConfig::default())
+            .init_resource::<ProjectileStatistics>()
+            .insert_resource(ProjectileCooldown(Timer::from_seconds(
+                0.0,
+                TimerMode::Once,
+            )))
+            .init_resource::<ProjectileCooldownClock>()
+            .insert_resource(ProjectileSetting(Handle::default(), Handle::default()))
+            .add_systems(
+                Update,
+                |mut gimbal: Single<&mut Transform, With<InfantryGimbal>>| {
+                    gimbal.rotation = Quat::from_euler(EulerRot::YXZ, 0.6, -0.2, 0.0);
+                },
+            )
+            .add_systems(
+                PostUpdate,
+                projectile_launch.after(TransformSystems::Propagate),
+            );
+        let chassis_transform =
+            Transform::from_xyz(3.0, 1.0, -2.0).with_rotation(Quat::from_rotation_y(0.7));
+        let chassis_velocity = Vec3::new(0.2, 0.0, -0.1);
+        let chassis = app
+            .world_mut()
+            .spawn((
+                chassis_transform,
+                Infantry::new(Team::Red, INFANTRY_THREE_CONFIG),
+                Controlled,
+                LinearVelocity(chassis_velocity),
+                AngularVelocity::ZERO,
+            ))
+            .id();
+        let gimbal_transform = Transform::from_xyz(0.04, 0.3, -0.06);
+        let gimbal = app
+            .world_mut()
+            .spawn((
+                gimbal_transform,
+                InfantryGimbal::default(),
+                ChildOf(chassis),
+            ))
+            .id();
+        let muzzle_transform =
+            Transform::from_xyz(-0.002, 0.11, -0.01).with_rotation(Quat::from_rotation_x(-1.13));
+        app.world_mut().spawn((
+            muzzle_transform,
+            InfantryLaunchOffset,
+            Controlled,
+            ChildOf(gimbal),
+        ));
+        app.update();
+
+        let current_gimbal = Transform {
+            rotation: Quat::from_euler(EulerRot::YXZ, 0.6, -0.2, 0.0),
+            ..gimbal_transform
+        };
+        let expected = GlobalTransform::from(chassis_transform)
+            .mul_transform(current_gimbal)
+            .mul_transform(muzzle_transform);
+        let speed = app.world().resource::<SimulationConfig>().projectile.speed;
+        let mut projectiles = app
+            .world_mut()
+            .query_filtered::<(&Transform, &LinearVelocity), With<Projectile>>();
+        let (projectile, velocity) = projectiles.single(app.world()).unwrap();
+        assert!(
+            projectile
+                .translation
+                .abs_diff_eq(expected.translation(), 1e-5)
+        );
+        assert!(velocity.0.abs_diff_eq(
+            chassis_velocity + expected.rotation() * Vec3::Y * speed,
+            1e-5
+        ));
+        assert_eq!(
+            app.world().resource::<ProjectileStatistics>().launch_count,
+            1
+        );
+    }
+
+    #[test]
+    fn sparse_fire_pulses_include_time_without_requests() {
+        let mut timer = Timer::new(Duration::from_millis(50), TimerMode::Once);
+        let mut clock = ProjectileCooldownClock::default();
+        assert!(try_consume_cooldown(
+            &mut timer,
+            &mut clock,
+            Duration::from_millis(100)
+        ));
+        assert!(!try_consume_cooldown(
+            &mut timer,
+            &mut clock,
+            Duration::from_millis(102)
+        ));
+        assert!(try_consume_cooldown(
+            &mut timer,
+            &mut clock,
+            Duration::from_millis(200)
+        ));
+        // An idle interval allows one shot without banking several shots.
+        assert!(!try_consume_cooldown(
+            &mut timer,
+            &mut clock,
+            Duration::from_millis(201)
+        ));
+    }
+
+    #[test]
+    fn manual_and_talos_requests_share_one_cooldown() {
+        let mut timer = Timer::new(Duration::from_millis(50), TimerMode::Once);
+        let mut clock = ProjectileCooldownClock::default();
+        let mut count = 0;
+        for ms in 0..=200 {
+            let now = Duration::from_millis(ms);
+            count += usize::from(try_consume_cooldown(&mut timer, &mut clock, now));
+            assert!(!try_consume_cooldown(&mut timer, &mut clock, now));
+        }
+        assert_eq!(count, 4);
     }
 }
